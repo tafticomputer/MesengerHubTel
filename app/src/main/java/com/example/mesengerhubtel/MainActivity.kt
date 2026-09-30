@@ -1,0 +1,516 @@
+package com.example.mesengerhubtel
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.DownloadManager
+import android.content.ActivityNotFoundException
+import android.content.ContentValues
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.media.MediaScannerConnection
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.util.Base64
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.MimeTypeMap
+import android.webkit.PermissionRequest
+import android.webkit.URLUtil
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
+import android.widget.LinearLayout
+import android.widget.Toast
+import androidx.core.content.FileProvider
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+
+/**
+ * هر پیام‌رسان در یک WebView مستقل (نسخه‌ی وب رسمی خودش) باز می‌شود
+ * و نشست ورود بین اجراها حفظ می‌شود.
+ * برای افزودن پیام‌رسان جدید یک خط به فهرست messengers اضافه کنید.
+ */
+class MainActivity : Activity() {
+
+    private data class Messenger(val name: String, val url: String) {
+        val baseDomain: String get() = Uri.parse(url).host.orEmpty().removePrefix("web.").removePrefix("www.")
+    }
+
+    // آدرس‌ها را پیش از انتشار بررسی کنید؛ ممکن است تغییر کرده باشند.
+    private val messengers = listOf(
+        Messenger("بله", "https://web.bale.ai"),
+        Messenger("ایتا", "https://web.eitaa.com"),
+        Messenger("روبیکا", "https://web.rubika.ir"),
+        Messenger("آیگپ", "https://web.igap.net"),
+        Messenger("گپ", "https://web.gap.im"),
+        Messenger("تلگرام", "https://web.telegram.org/k/"),
+        Messenger("اینستاگرام", "https://www.instagram.com"),
+        Messenger("واتس‌اپ", "https://web.whatsapp.com"),
+        Messenger("ایکس", "https://x.com"),
+    )
+
+    // WebView این قابلیت‌ها را ندارد؛ با این اسکریپت به کد بومی وصلشان می‌کنیم:
+    //  - navigator.share  (دکمه‌ی «اشتراک‌گذاری» سایت‌ها)
+    private val shimJs = """
+        (function () {
+          if (window.__hubShimInstalled) return;
+          window.__hubShimInstalled = true;
+          function toB64(file) {
+            return new Promise(function (resolve, reject) {
+              var r = new FileReader();
+              r.onload = function () { resolve(String(r.result).split(',')[1] || ''); };
+              r.onerror = reject;
+              r.readAsDataURL(file);
+            });
+          }
+          navigator.canShare = function (d) { return !!d; };
+          navigator.share = async function (data) {
+            data = data || {};
+            var files = [];
+            if (data.files) {
+              for (var i = 0; i < data.files.length; i++) {
+                var f = data.files[i];
+                files.push({ name: f.name, type: f.type, data: await toB64(f) });
+              }
+            }
+            AndroidHub.share(JSON.stringify({
+              title: data.title || '', text: data.text || '', url: data.url || '', files: files
+            }));
+          };
+        })();
+    """.trimIndent()
+
+    // WebView هر پیام‌رسان فقط در اولین باری که تبش انتخاب می‌شود ساخته می‌شود (بارگذاری تنبل)،
+    // نه همه‌شان همزمان موقع باز شدن برنامه — همین باعث سریع‌تر بالا آمدن برنامه و سبک‌تر ماندن آن می‌شود.
+    private val webViews = arrayOfNulls<WebView>(messengers.size)
+    private val tabButtons = mutableListOf<Button>()
+    private lateinit var content: FrameLayout
+    private var current = 0
+
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
+    private var cameraPhotoUri: Uri? = null
+    private val fileRequestCode = 1001
+    private val permissionRequestCode = 2001
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // دوربین/میکروفون برای تماس و ضبط صدا، و دسترسی به گالری/حافظه برای پیوست و ذخیره‌ی فایل.
+        val neededPermissions = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            neededPermissions += Manifest.permission.READ_MEDIA_IMAGES
+            neededPermissions += Manifest.permission.READ_MEDIA_VIDEO
+        } else {
+            neededPermissions += Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            neededPermissions += Manifest.permission.WRITE_EXTERNAL_STORAGE
+        }
+        val missing = neededPermissions.filter {
+            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            requestPermissions(missing.toTypedArray(), permissionRequestCode)
+        }
+
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            fitsSystemWindows = true
+        }
+        val tabBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val tabScroll = HorizontalScrollView(this).apply { addView(tabBar) }
+        content = FrameLayout(this)
+
+        messengers.forEachIndexed { i, m ->
+            val button = Button(this).apply {
+                text = m.name
+                setOnClickListener { select(i) }
+            }
+            tabButtons += button
+            tabBar.addView(button)
+        }
+
+        root.addView(tabScroll, LinearLayout.LayoutParams(match, wrap))
+        root.addView(content, LinearLayout.LayoutParams(match, 0, 1f))
+        setContentView(root)
+
+        select(0)
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createWebView(m: Messenger): WebView {
+        val webView = WebView(this)
+        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        webView.visibility = View.GONE
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.settings.databaseEnabled = true
+        webView.settings.mediaPlaybackRequiresUserGesture = false
+        webView.settings.allowFileAccess = false
+        webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
+        webView.settings.setSupportMultipleWindows(true)
+        webView.settings.javaScriptCanOpenWindowsAutomatically = true
+        // این دو باعث می‌شود صفحه از همان ابتدا با اندازه‌ی درست رندر شود، نه اینکه اول با زوم اشتباه
+        // بارگذاری شود و بعد خودش را اصلاح کند — که در WebView حس کندی ایجاد می‌کند.
+        webView.settings.loadWithOverviewMode = true
+        webView.settings.useWideViewPort = true
+        @Suppress("DEPRECATION")
+        webView.settings.setRenderPriority(WebSettings.RenderPriority.HIGH)
+        val ua = webView.settings.userAgentString
+        if (ua != null) webView.settings.userAgentString = ua.replace("; wv", "")
+
+        val cookies = CookieManager.getInstance()
+        cookies.setAcceptCookie(true)
+        cookies.setAcceptThirdPartyCookies(webView, true)
+
+        webView.addJavascriptInterface(HubBridge(), "AndroidHub")
+
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                view.evaluateJavascript(shimJs, null)
+            }
+
+            override fun onPageFinished(view: WebView, url: String?) {
+                super.onPageFinished(view, url)
+                view.evaluateJavascript(shimJs, null)
+            }
+
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                val host = request.url.host.orEmpty()
+                val internal = host == m.baseDomain || host.endsWith("." + m.baseDomain)
+                if (internal) return false
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, request.url))
+                } catch (_: ActivityNotFoundException) {
+                }
+                return true
+            }
+        }
+
+        webView.webChromeClient = object : WebChromeClient() {
+
+            override fun onCreateWindow(
+                view: WebView,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message,
+            ): Boolean {
+                val popup = WebView(this@MainActivity).apply {
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
+                            try {
+                                startActivity(Intent(Intent.ACTION_VIEW, request.url))
+                            } catch (_: ActivityNotFoundException) {
+                            }
+                            return true
+                        }
+                    }
+                }
+                val transport = resultMsg.obj as WebView.WebViewTransport
+                transport.webView = popup
+                resultMsg.sendToTarget()
+                return true
+            }
+
+            override fun onPermissionRequest(request: PermissionRequest) {
+                runOnUiThread { request.grant(request.resources) }
+            }
+
+            override fun onShowFileChooser(
+                webView: WebView,
+                filePathCallback: ValueCallback<Array<Uri>>,
+                fileChooserParams: FileChooserParams,
+            ): Boolean {
+                fileCallback?.onReceiveValue(null)
+                fileCallback = filePathCallback
+
+                val captureIntents = mutableListOf<Intent>()
+                try {
+                    val photoFile = File.createTempFile(
+                        "capture_", ".jpg", getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+                    )
+                    val photoUri = FileProvider.getUriForFile(
+                        this@MainActivity, "$packageName.fileprovider", photoFile
+                    )
+                    cameraPhotoUri = photoUri
+                    val cameraIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                        putExtra(MediaStore.EXTRA_OUTPUT, photoUri)
+                        addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                    }
+                    if (cameraIntent.resolveActivity(packageManager) != null) captureIntents += cameraIntent
+                } catch (_: Exception) {
+                }
+
+                val contentIntent = fileChooserParams.createIntent()
+                val chooser = Intent.createChooser(contentIntent, "انتخاب فایل").apply {
+                    if (captureIntents.isNotEmpty()) {
+                        putExtra(Intent.EXTRA_INITIAL_INTENTS, captureIntents.toTypedArray())
+                    }
+                }
+                return try {
+                    startActivityForResult(chooser, fileRequestCode)
+                    true
+                } catch (_: ActivityNotFoundException) {
+                    fileCallback = null
+                    false
+                }
+            }
+        }
+
+        // دانلود/ذخیره: سه نوع لینک داریم — blob: (رایج در پیام‌رسان‌ها)، data: و http(s).
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            val hintedName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+            when {
+                url.startsWith("blob:") -> {
+                    // blob فقط داخل همان صفحه قابل خواندن است؛ پس با جاوااسکریپت می‌خوانیم و به کد بومی می‌دهیم.
+                    val js = "(function(){fetch(" + JSONObject.quote(url) + ")" +
+                        ".then(function(r){return r.blob();})" +
+                        ".then(function(b){var fr=new FileReader();" +
+                        "fr.onloadend=function(){AndroidHub.saveBase64(String(fr.result).split(',')[1]||''," +
+                        "b.type||" + JSONObject.quote(mimeType ?: "") + "," + JSONObject.quote(hintedName) + ");};" +
+                        "fr.readAsDataURL(b);})" +
+                        ".catch(function(){AndroidHub.toast('ذخیره‌ی فایل ناموفق بود');});})();"
+                    webView.evaluateJavascript(js, null)
+                }
+                url.startsWith("data:") -> {
+                    Thread {
+                        try {
+                            val header = url.substringBefore(',').removePrefix("data:")
+                            val payload = url.substringAfter(',')
+                            val mime = header.substringBefore(';').ifBlank { "application/octet-stream" }
+                            val bytes = if (header.contains("base64")) {
+                                Base64.decode(payload, Base64.DEFAULT)
+                            } else {
+                                Uri.decode(payload).toByteArray()
+                            }
+                            val name = fixFileName(hintedName, mime)
+                            saveBytes(bytes, mime, name)
+                            showToast("ذخیره شد: $name")
+                        } catch (_: Exception) {
+                            showToast("ذخیره‌ی فایل ناموفق بود")
+                        }
+                    }.start()
+                }
+                else -> {
+                    try {
+                        val request = DownloadManager.Request(Uri.parse(url)).apply {
+                            if (!mimeType.isNullOrBlank()) setMimeType(mimeType)
+                            CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
+                            if (!userAgent.isNullOrBlank()) addRequestHeader("User-Agent", userAgent)
+                            setTitle(hintedName)
+                            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, hintedName)
+                        }
+                        (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+                        showToast("دانلود شروع شد: $hintedName")
+                    } catch (_: Exception) {
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                        } catch (_: ActivityNotFoundException) {
+                            showToast("دانلود ناموفق بود")
+                        }
+                    }
+                }
+            }
+        }
+        return webView
+    }
+
+    /** پل بین جاوااسکریپت صفحه و کد بومی (ذخیره‌ی فایل و اشتراک‌گذاری). */
+    private inner class HubBridge {
+
+        @JavascriptInterface
+        fun toast(message: String) = showToast(message)
+
+        @JavascriptInterface
+        fun saveBase64(base64: String, mime: String, name: String) {
+            try {
+                val bytes = Base64.decode(base64, Base64.DEFAULT)
+                val finalName = fixFileName(name, mime)
+                saveBytes(bytes, mime, finalName)
+                showToast("ذخیره شد: $finalName")
+            } catch (_: Exception) {
+                showToast("ذخیره‌ی فایل ناموفق بود")
+            }
+        }
+
+        @JavascriptInterface
+        fun share(json: String) {
+            try {
+                val obj = JSONObject(json)
+                val title = obj.optString("title")
+                val text = obj.optString("text")
+                val url = obj.optString("url")
+                val files = obj.optJSONArray("files")
+
+                val uris = ArrayList<Uri>()
+                var mime: String? = null
+                if (files != null && files.length() > 0) {
+                    val dir = File(cacheDir, "shared").apply { mkdirs() }
+                    for (i in 0 until files.length()) {
+                        val f = files.getJSONObject(i)
+                        val type = f.optString("type").ifBlank { "application/octet-stream" }
+                        val out = File(dir, fixFileName(f.optString("name"), type))
+                        out.writeBytes(Base64.decode(f.optString("data"), Base64.DEFAULT))
+                        uris += FileProvider.getUriForFile(this@MainActivity, "$packageName.fileprovider", out)
+                        mime = if (mime == null || mime == type) type else "*/*"
+                    }
+                }
+
+                val message = listOf(text, url).filter { it.isNotBlank() }.joinToString("\n")
+                val intent = if (uris.size > 1) {
+                    Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                        type = mime ?: "*/*"
+                        putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                    }
+                } else {
+                    Intent(Intent.ACTION_SEND).apply {
+                        if (uris.size == 1) {
+                            type = mime ?: "*/*"
+                            putExtra(Intent.EXTRA_STREAM, uris[0])
+                        } else {
+                            type = "text/plain"
+                        }
+                    }
+                }
+                if (message.isNotBlank()) intent.putExtra(Intent.EXTRA_TEXT, message)
+                if (title.isNotBlank()) intent.putExtra(Intent.EXTRA_SUBJECT, title)
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+                runOnUiThread { startActivity(Intent.createChooser(intent, "اشتراک‌گذاری")) }
+            } catch (_: Exception) {
+                showToast("اشتراک‌گذاری ناموفق بود")
+            }
+        }
+    }
+
+    private fun showToast(message: String) {
+        runOnUiThread { Toast.makeText(this, message, Toast.LENGTH_SHORT).show() }
+    }
+
+    /** نام فایل امن + پسوند درست بر اساس نوع فایل (اگر نام پسوند نداشته باشد یا .bin باشد). */
+    private fun fixFileName(name: String?, mime: String?): String {
+        var n = (name ?: "").replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+        if (n.isEmpty()) n = "file_" + System.currentTimeMillis()
+        val ext = mime?.substringBefore(';')
+            ?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
+        val current = n.substringAfterLast('.', "")
+        val hasGoodExt = current.isNotEmpty() && current.length <= 5 && current != "bin"
+        if (!hasGoodExt) {
+            n = n.removeSuffix(".bin")
+            if (ext != null) n += ".$ext"
+        }
+        return n
+    }
+
+    /** عکس → Pictures، ویدیو → Movies (تا در گالری دیده شوند)، بقیه → Downloads. */
+    private fun saveBytes(bytes: ByteArray, mime: String, name: String) {
+        val type = mime.substringBefore(';').ifBlank { "application/octet-stream" }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val collection: Uri
+            val folder: String
+            when {
+                type.startsWith("image/") -> {
+                    collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                    folder = Environment.DIRECTORY_PICTURES + "/MesengerHubTel"
+                }
+                type.startsWith("video/") -> {
+                    collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                    folder = Environment.DIRECTORY_MOVIES + "/MesengerHubTel"
+                }
+                else -> {
+                    collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                    folder = Environment.DIRECTORY_DOWNLOADS + "/MesengerHubTel"
+                }
+            }
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, type)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, folder)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(collection, values)
+                ?: throw IllegalStateException("insert failed")
+            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                ?: throw IllegalStateException("no output stream")
+            values.clear()
+            values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            contentResolver.update(uri, values, null, null)
+        } else {
+            val dir = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "MesengerHubTel"
+            ).apply { mkdirs() }
+            val file = File(dir, name)
+            FileOutputStream(file).use { it.write(bytes) }
+            MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf(type), null)
+        }
+    }
+
+    private fun select(index: Int) {
+        current = index
+        if (webViews[index] == null) {
+            val match = ViewGroup.LayoutParams.MATCH_PARENT
+            val webView = createWebView(messengers[index])
+            webViews[index] = webView
+            content.addView(webView, FrameLayout.LayoutParams(match, match))
+            webView.loadUrl(messengers[index].url)
+        }
+        webViews.forEachIndexed { i, wv ->
+            wv?.visibility = if (i == index) View.VISIBLE else View.GONE
+            tabButtons[i].isEnabled = i != index
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == fileRequestCode) {
+            var result: Array<Uri>? = WebChromeClient.FileChooserParams.parseResult(resultCode, data)
+            val photo = cameraPhotoUri
+            if (result == null && resultCode == RESULT_OK && photo != null) {
+                result = arrayOf(photo)
+            }
+            fileCallback?.onReceiveValue(result)
+            fileCallback = null
+            cameraPhotoUri = null
+        } else {
+            super.onActivityResult(requestCode, resultCode, data)
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        val wv = webViews[current]
+        if (wv != null && wv.canGoBack()) wv.goBack() else super.onBackPressed()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        CookieManager.getInstance().flush()
+    }
+
+    override fun onDestroy() {
+        webViews.forEach { it?.destroy() }
+        super.onDestroy()
+    }
+}
