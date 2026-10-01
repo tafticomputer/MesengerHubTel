@@ -12,6 +12,9 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
@@ -19,6 +22,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -32,10 +36,10 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import org.json.JSONObject
@@ -49,21 +53,22 @@ import java.io.FileOutputStream
  */
 class MainActivity : Activity() {
 
-    private data class Messenger(val name: String, val url: String) {
+    private data class Messenger(val name: String, val url: String, val color: Int) {
         val baseDomain: String get() = Uri.parse(url).host.orEmpty().removePrefix("web.").removePrefix("www.")
     }
 
     // آدرس‌ها را پیش از انتشار بررسی کنید؛ ممکن است تغییر کرده باشند.
+    // رنگ‌ها فقط برای تشخیص سریع هر تب هستند (یک نقطه‌ی رنگی کوچک)، نه کپی لوگوی هیچ برندی.
     private val messengers = listOf(
-        Messenger("بله", "https://web.bale.ai"),
-        Messenger("ایتا", "https://web.eitaa.com"),
-        Messenger("روبیکا", "https://web.rubika.ir"),
-        Messenger("آیگپ", "https://web.igap.net"),
-        Messenger("گپ", "https://web.gap.im"),
-        Messenger("تلگرام", "https://web.telegram.org/k/"),
-        Messenger("اینستاگرام", "https://www.instagram.com"),
-        Messenger("واتس‌اپ", "https://web.whatsapp.com"),
-        Messenger("ایکس", "https://x.com"),
+        Messenger("بله", "https://web.bale.ai", Color.parseColor("#2AABEE")),
+        Messenger("ایتا", "https://web.eitaa.com", Color.parseColor("#12A4DE")),
+        Messenger("روبیکا", "https://web.rubika.ir", Color.parseColor("#FF7A00")),
+        Messenger("آیگپ", "https://web.igap.net", Color.parseColor("#00B389")),
+        Messenger("گپ", "https://web.gap.im", Color.parseColor("#7C5CFC")),
+        Messenger("تلگرام", "https://web.telegram.org/k/", Color.parseColor("#229ED9")),
+        Messenger("اینستاگرام", "https://www.instagram.com", Color.parseColor("#C8328C")),
+        Messenger("واتس‌اپ", "https://web.whatsapp.com", Color.parseColor("#25D366")),
+        Messenger("ایکس", "https://x.com", Color.parseColor("#111111")),
     )
 
     // WebView این قابلیت‌ها را ندارد؛ با این اسکریپت به کد بومی وصلشان می‌کنیم:
@@ -100,9 +105,15 @@ class MainActivity : Activity() {
     // WebView هر پیام‌رسان فقط در اولین باری که تبش انتخاب می‌شود ساخته می‌شود (بارگذاری تنبل)،
     // نه همه‌شان همزمان موقع باز شدن برنامه — همین باعث سریع‌تر بالا آمدن برنامه و سبک‌تر ماندن آن می‌شود.
     private val webViews = arrayOfNulls<WebView>(messengers.size)
-    private val tabButtons = mutableListOf<Button>()
+    private val tabChips = mutableListOf<TextView>()
     private lateinit var content: FrameLayout
     private var current = 0
+
+    // رنگ‌های هویت بصری اپ؛ همان طیف گرادیانت آیکن (آبی به بنفش).
+    private val accentStart = Color.parseColor("#4F6EF7")
+    private val accentEnd = Color.parseColor("#8B4FF7")
+    private val tabUnselectedBg = Color.parseColor("#F1F2F7")
+    private val tabUnselectedText = Color.parseColor("#3A3B46")
 
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private var cameraPhotoUri: Uri? = null
@@ -142,27 +153,72 @@ class MainActivity : Activity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             fitsSystemWindows = true
+            setBackgroundColor(Color.WHITE)
         }
-        val tabBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val tabScroll = HorizontalScrollView(this).apply { addView(tabBar) }
+
+        val tabBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+        }
+        val tabScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setBackgroundColor(Color.WHITE)
+            addView(tabBar)
+        }
+        val tabDivider = View(this).apply { setBackgroundColor(Color.parseColor("#E7E8EF")) }
+        val tabBarContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            elevation = dp(3).toFloat()
+            addView(tabScroll)
+            addView(tabDivider, LinearLayout.LayoutParams(match, dp(1)))
+        }
         content = FrameLayout(this)
 
         messengers.forEachIndexed { i, m ->
-            val button = Button(this).apply {
+            val dot = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(m.color)
+                setSize(dp(9), dp(9))
+            }
+            val chip = TextView(this).apply {
                 text = m.name
+                textSize = 14f
+                gravity = Gravity.CENTER
+                setPadding(dp(16), dp(10), dp(16), dp(10))
+                compoundDrawablePadding = dp(7)
+                setCompoundDrawablesWithIntrinsicBounds(dot, null, null, null)
                 setOnClickListener { select(i) }
             }
-            tabButtons += button
-            tabBar.addView(button)
+            tabChips += chip
+            tabBar.addView(chip, LinearLayout.LayoutParams(wrap, wrap).apply { marginEnd = dp(8) })
         }
 
-        root.addView(tabScroll, LinearLayout.LayoutParams(match, wrap))
+        root.addView(tabBarContainer, LinearLayout.LayoutParams(match, wrap))
         root.addView(content, LinearLayout.LayoutParams(match, 0, 1f))
         setContentView(root)
 
         select(0)
         prefetchDns()
         handleIncomingShare(intent)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    /** پس‌زمینه‌ی تب فعال: گرادیانت آبی به بنفش هم‌رنگ آیکن برنامه؛ تب‌های غیرفعال خاکستری روشن. */
+    private fun pillBackground(selected: Boolean): GradientDrawable = GradientDrawable().apply {
+        cornerRadius = dp(22).toFloat()
+        if (selected) {
+            orientation = GradientDrawable.Orientation.TL_BR
+            colors = intArrayOf(accentStart, accentEnd)
+        } else {
+            setColor(tabUnselectedBg)
+        }
+    }
+
+    private fun styleChip(chip: TextView, selected: Boolean) {
+        chip.background = pillBackground(selected)
+        chip.setTextColor(if (selected) Color.WHITE else tabUnselectedText)
+        chip.typeface = Typeface.create(Typeface.DEFAULT, if (selected) Typeface.BOLD else Typeface.NORMAL)
     }
 
     // اتصال به هر پیام‌رسان با یک جست‌وجوی DNS شروع می‌شود؛ این کار را برای همه از قبل و در پس‌زمینه
@@ -172,6 +228,14 @@ class MainActivity : Activity() {
             Thread {
                 try {
                     java.net.InetAddress.getAllByName(m.baseDomain)
+                    // یک دست‌دهی واقعی TLS هم انجام می‌دهیم (و بلافاصله می‌بندیم)، چون خود این
+                    // فرایند (نه فقط DNS) معمولاً بیشترین تأخیر اولین اتصال را تشکیل می‌دهد.
+                    (java.net.URL("https://" + m.baseDomain).openConnection() as javax.net.ssl.HttpsURLConnection).apply {
+                        connectTimeout = 4000
+                        requestMethod = "HEAD"
+                        connect()
+                        disconnect()
+                    }
                 } catch (_: Exception) {
                 }
             }.start()
@@ -606,10 +670,8 @@ class MainActivity : Activity() {
             content.addView(webView, FrameLayout.LayoutParams(match, match))
             webView.loadUrl(messengers[index].url)
         }
-        webViews.forEachIndexed { i, wv ->
-            wv?.visibility = if (i == index) View.VISIBLE else View.GONE
-            tabButtons[i].isEnabled = i != index
-        }
+        webViews.forEachIndexed { i, wv -> wv?.visibility = if (i == index) View.VISIBLE else View.GONE }
+        tabChips.forEachIndexed { i, chip -> styleChip(chip, i == index) }
     }
 
     @Deprecated("Deprecated in Java")
