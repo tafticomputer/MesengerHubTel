@@ -3,8 +3,11 @@ package com.example.mesengerhubtel
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.DownloadManager
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -106,6 +109,12 @@ class MainActivity : Activity() {
     private val fileRequestCode = 1001
     private val permissionRequestCode = 2001
 
+    // وقتی کاربر از یک پیام‌رسان (یا هر اپ دیگر) روی «اشتراک‌گذاری» بزند و این اپ را انتخاب کند،
+    // متن/فایل اینجا نگه داشته می‌شود تا کاربر پیام‌رسان مقصد را انتخاب کند.
+    private var pendingShareText: String? = null
+    private var pendingShareFileUri: Uri? = null
+    private var pendingShareFileType: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -152,6 +161,122 @@ class MainActivity : Activity() {
         setContentView(root)
 
         select(0)
+        prefetchDns()
+        handleIncomingShare(intent)
+    }
+
+    // اتصال به هر پیام‌رسان با یک جست‌وجوی DNS شروع می‌شود؛ این کار را برای همه از قبل و در پس‌زمینه
+    // انجام می‌دهیم تا وقتی کاربر تب را باز کرد، نتیجه از حافظه‌ی سیستم خوانده شود، نه از صفر.
+    private fun prefetchDns() {
+        messengers.forEach { m ->
+            Thread {
+                try {
+                    java.net.InetAddress.getAllByName(m.baseDomain)
+                } catch (_: Exception) {
+                }
+            }.start()
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingShare(intent)
+    }
+
+    /** وقتی کاربر از جای دیگری (یا از خود یک پیام‌رسان) چیزی را با این اپ به‌اشتراک بگذارد. */
+    private fun handleIncomingShare(intent: Intent?) {
+        if (intent == null) return
+        if (intent.action != Intent.ACTION_SEND && intent.action != Intent.ACTION_SEND_MULTIPLE) return
+
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        @Suppress("DEPRECATION")
+        val stream = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+
+        if (text.isNullOrBlank() && stream == null) return
+
+        pendingShareText = text
+        pendingShareFileUri = stream
+        pendingShareFileType = intent.type
+
+        val names = messengers.map { it.name }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("ارسال به کدام پیام‌رسان؟")
+            .setItems(names) { _, which -> forwardPendingShareTo(which) }
+            .setNegativeButton("انصراف") { d, _ ->
+                pendingShareText = null; pendingShareFileUri = null; d.dismiss()
+            }
+            .setCancelable(true)
+            .show()
+    }
+
+    /** تب مقصد را باز می‌کند، متن را در کلیپ‌بورد می‌گذارد و تلاش می‌کند خودکار در کادر پیام بنویسد. */
+    private fun forwardPendingShareTo(index: Int) {
+        select(index)
+        val text = pendingShareText
+        val fileUri = pendingShareFileUri
+
+        if (!text.isNullOrBlank()) {
+            val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("پیام", text))
+            val target = webViews[index]
+            if (target != null) {
+                target.postDelayed({ tryInjectComposerText(target, text) }, 900)
+            }
+            showToast("متن کپی شد؛ اگر خودکار درج نشد، در کادر پیام Paste کنید")
+        }
+
+        if (fileUri != null) {
+            showToast("فایل در Downloads/MesengerHubTel ذخیره شد؛ از دکمه‌ی پیوست همین‌جا انتخابش کنید")
+            Thread {
+                try {
+                    val type = pendingShareFileType ?: "application/octet-stream"
+                    val bytes = contentResolver.openInputStream(fileUri)?.use { it.readBytes() }
+                    if (bytes != null) {
+                        val name = fixFileName(fileUri.lastPathSegment, type)
+                        saveBytes(bytes, type, name)
+                    }
+                } catch (_: Exception) {
+                    showToast("ذخیره‌ی فایل برای ارسال ناموفق بود")
+                }
+            }.start()
+        }
+
+        pendingShareText = null
+        pendingShareFileUri = null
+        pendingShareFileType = null
+    }
+
+    /** تلاش خودکار (best-effort) برای پیدا کردن کادر نوشتن پیام و درج متن در آن؛ اگر نشد، کلیپ‌بورد پشتیبان است. */
+    private fun tryInjectComposerText(webView: WebView, text: String) {
+        val js = """
+            (function () {
+              function setNativeValue(el, value) {
+                var proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; }
+              }
+              var els = Array.prototype.slice.call(
+                document.querySelectorAll('textarea, [contenteditable="true"], div[role="textbox"]')
+              ).filter(function (el) {
+                var r = el.getBoundingClientRect();
+                return r.width > 50 && r.height > 10 && el.offsetParent !== null;
+              });
+              if (els.length === 0) return false;
+              var el = els[els.length - 1];
+              el.focus();
+              if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+                setNativeValue(el, ${JSONObject.quote(text)});
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+              } else {
+                el.innerText = ${JSONObject.quote(text)};
+                el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+              }
+              return true;
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -173,6 +298,11 @@ class MainActivity : Activity() {
         webView.settings.useWideViewPort = true
         @Suppress("DEPRECATION")
         webView.settings.setRenderPriority(WebSettings.RenderPriority.HIGH)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // بررسی Safe Browsing گوگل روی اولین بارگذاری هر سایت چند ثانیه تأخیر ایجاد می‌کند؛
+            // چون آدرس‌های پیام‌رسان‌ها ثابت و شناخته‌شده‌اند، این بررسی را خاموش می‌کنیم.
+            webView.settings.safeBrowsingEnabled = false
+        }
         val ua = webView.settings.userAgentString
         if (ua != null) webView.settings.userAgentString = ua.replace("; wv", "")
 
