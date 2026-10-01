@@ -27,4 +27,3 @@ jobs:
         with:
           name: MesengerHubTel-debug-apk
           path: app/build/outputs/apk/debug/*.apk
-
